@@ -48,7 +48,7 @@ def _decode_text(buf: bytes) -> Optional[str]:
 
 def _resolve_tag_refs(text: str, name_lookup: Dict[int, str]) -> str:
     """Replace ``@XXXXXXXX@`` hex placeholders with their comp names."""
-    for tag in re.findall(r"@[A-Za-z0-9]*@", text):
+    for tag in re.findall(r"@[A-Fa-f0-9]+@", text):
         try:
             tag_id = int(tag[1:-1], 16)
         except ValueError:
@@ -205,7 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: ACD file not found: {acd_path}", file=sys.stderr)
         return 1
 
-    # Use a temporary directory so we leave no artefacts behind.
+    # Use a temporary directory so we leave no artifacts behind.
     temp_dir = tempfile.mkdtemp(prefix="inspect_sbregion_")
     try:
         return _run(acd_path, temp_dir, args)
@@ -237,7 +237,6 @@ def _run(acd_path: Path, temp_dir: str, args) -> int:
     # -----------------------------------------------------------------------
     # Step 3: Parse every record in SbRegion.Dat.
     # -----------------------------------------------------------------------
-    sbregion_path = str(acd_path.parent / temp_dir / "SbRegion.Dat")
     # ExportL5x writes extracted files into temp_dir directly.
     import os
     sbregion_path = os.path.join(temp_dir, "SbRegion.Dat")
