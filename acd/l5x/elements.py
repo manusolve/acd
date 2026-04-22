@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import List, Optional, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
@@ -752,6 +752,7 @@ class Routine(L5xElement):
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
+    _st_source: Optional[List[str]] = field(default=None)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -773,7 +774,14 @@ class Routine(L5xElement):
                 )
             if rung_xmls:
                 rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
+        st_content = ""
+        if self.type == "ST" and self._st_source:
+            line_xmls = [
+                f'<Line Number="{i}"><![CDATA[{line}]]></Line>'
+                for i, line in enumerate(self._st_source)
+            ]
+            st_content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}{st_content}</Routine>'
 
 
 @dataclass
@@ -1872,7 +1880,12 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments)
+        st_source: Optional[List[str]] = None
+        if routine_type == "ST":
+            from acd.l5x.st_routine import StRoutineBuilder
+            st_source = StRoutineBuilder(self._cur, self._object_id).build()
+
+        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments, st_source)
 
 
 def _parse_fffeff(data: bytes, offset: int):
