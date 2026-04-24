@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
@@ -1836,28 +1836,37 @@ class RoutineBuilder(L5xElementBuilder):
         # then filter + sort in Python.
         if routine_type == "ST":
             from acd.record.nameless import parse_source_line
+            from collections import defaultdict
             import re as _re
             st_lines: List[str] = []
             st_ids: List[int] = []
+            # Fetch the full nameless subtree for this ST routine, including
+            # parent_id so we can reconstruct the ordered child-ID lists that
+            # the ACD stores inside parent blobs.
             self._cur.execute(
                 """
-                WITH RECURSIVE subtree(object_id, record) AS (
-                    SELECT object_id, record
+                WITH RECURSIVE subtree(object_id, parent_id, record) AS (
+                    SELECT object_id, parent_id, record
                     FROM nameless
                     WHERE parent_id = ?
                     UNION ALL
-                    SELECT n.object_id, n.record
+                    SELECT n.object_id, n.parent_id, n.record
                     FROM nameless n
                     JOIN subtree s ON n.parent_id = s.object_id
                 )
-                SELECT object_id, record FROM subtree
+                SELECT object_id, parent_id, record FROM subtree
                 """,
                 (self._object_id,),
             )
             raw_lines: List[str] = []
-            candidates: List[tuple] = []
-            for obj_id, blob in self._cur.fetchall():
+            # node_buf: oid → raw bytes for all subtree nodes (needed to read
+            # the ordered child-ID lists stored in parent blobs).
+            node_buf: Dict[int, bytes] = {}
+            # src_lines_info: oid → (seq, parent_oid, line_text) for real ST source lines
+            src_lines_info: Dict[int, tuple] = {}
+            for obj_id, par_id, blob in self._cur.fetchall():
                 buf = bytes(blob)
+                node_buf[obj_id] = buf
                 line = parse_source_line(buf)
                 if line is None:
                     continue
@@ -1865,10 +1874,59 @@ class RoutineBuilder(L5xElementBuilder):
                 if seq == 0xFFFFFFFF:
                     # Compiled/ladder-equivalent record — not ST source text.
                     continue
-                candidates.append((seq, obj_id, line))
-            candidates.sort(key=lambda x: x[0])
-            raw_lines = [c[2] for c in candidates]
-            st_ids = [c[1] for c in candidates]
+                src_lines_info[obj_id] = (seq, par_id, line)
+
+            # Determine display order using the ordered child-ID list embedded in
+            # the parent blob.  The ACD stores display order as:
+            #   parent_buf[24:26]  = uint16 LE count of children
+            #   parent_buf[26:26+count*4] = child OIDs in display order
+            # This list is authoritative; the `seq` field is a global edit
+            # counter and does NOT encode display position (lines edited or
+            # re-inserted after initial creation get a later seq number but
+            # keep their original position in the ordered list).
+            #
+            # Strategy:
+            #  1. Group source lines by their direct parent OID.
+            #  2. For each parent, try to read the embedded ordered ID list.
+            #     If all children are covered, use that order.
+            #  3. Fall back to seq-sorting per group when no embedded list is
+            #     found (works for simple routines where lines were typed in
+            #     order and never re-ordered).
+            #  4. Sort groups by minimum seq so inter-group ordering is stable.
+
+            def _ordered_for_parent(par_oid: int, child_oids: List[int]) -> List[int]:
+                """Return child_oids in display order using parent blob or seq fallback."""
+                child_set = set(child_oids)
+                if par_oid in node_buf:
+                    pbuf = node_buf[par_oid]
+                    if len(pbuf) >= 26:
+                        count = struct.unpack_from("<H", pbuf, 24)[0]
+                        if count == len(child_set) and 26 + count * 4 <= len(pbuf):
+                            ids = [
+                                struct.unpack_from("<I", pbuf, 26 + i * 4)[0]
+                                for i in range(count)
+                            ]
+                            if set(ids) == child_set:
+                                return ids
+                # Fall back: sort by seq
+                return sorted(child_oids, key=lambda o: src_lines_info[o][0])
+
+            # Group source lines by parent
+            groups: Dict[int, List[int]] = defaultdict(list)
+            for src_oid, (seq, par_id, _) in src_lines_info.items():
+                groups[par_id].append(src_oid)
+
+            # Build final ordered list, sorting groups by minimum seq
+            group_order: List[tuple] = []
+            for par_oid, child_oids in groups.items():
+                min_seq = min(src_lines_info[o][0] for o in child_oids)
+                ordered = _ordered_for_parent(par_oid, child_oids)
+                group_order.append((min_seq, ordered))
+            group_order.sort(key=lambda g: g[0])
+
+            ordered_oids = [o for _, grp in group_order for o in grp]
+            raw_lines = [src_lines_info[o][2] for o in ordered_oids]
+            st_ids = ordered_oids
             # Resolve @XXXXXXXX@ tag-reference placeholders to comp names.
             all_hex_at = set(
                 m for line in raw_lines for m in _re.findall(r'@([0-9a-f]{8})@', line)
