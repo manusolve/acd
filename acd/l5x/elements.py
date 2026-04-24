@@ -752,9 +752,11 @@ class Routine(L5xElement):
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
+    st_lines: List[str] = field(default_factory=list)
+    _st_source_ids: List[int] = field(default_factory=list)
 
     def to_xml(self) -> str:
-        rll_content = ""
+        content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
             for i, rung_text in enumerate(self.rungs):
@@ -772,8 +774,14 @@ class Routine(L5xElement):
                     f'</Rung>'
                 )
             if rung_xmls:
-                rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
+                content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        elif self.type == "ST" and self.st_lines:
+            line_xmls = [
+                f'<Line Number="{i}"><![CDATA[{text}]]></Line>'
+                for i, text in enumerate(self.st_lines)
+            ]
+            content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{content}</Routine>'
 
 
 @dataclass
@@ -1819,6 +1827,46 @@ class RoutineBuilder(L5xElementBuilder):
         routine_type = routine_type_enum(
             struct.unpack_from("<H", r.record_buffer, 0x30)[0]
         )
+
+        # ST routines store source lines in the nameless table, not in region_map/rungs.
+        if routine_type == "ST":
+            from acd.record.nameless import parse_source_line
+            import re as _re
+            st_lines: List[str] = []
+            st_ids: List[int] = []
+            self._cur.execute(
+                "SELECT object_id, record FROM nameless WHERE parent_id=? ORDER BY rowid",
+                (self._object_id,),
+            )
+            raw_lines: List[str] = []
+            for obj_id, blob in self._cur.fetchall():
+                line = parse_source_line(bytes(blob))
+                if line is None:
+                    continue
+                raw_lines.append(line)
+                st_ids.append(obj_id)
+            # Resolve @XXXXXXXX@ tag-reference placeholders to comp names.
+            all_hex_at = set(
+                m for line in raw_lines for m in _re.findall(r'@([0-9a-f]{8})@', line)
+            )
+            if all_hex_at:
+                id_to_name_at: Dict[str, str] = {}
+                for hex_id in all_hex_at:
+                    oid = int(hex_id, 16)
+                    self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (oid,))
+                    row2 = self._cur.fetchone()
+                    if row2:
+                        id_to_name_at[hex_id] = row2[0]
+                if id_to_name_at:
+                    def _resolve_at(line: str) -> str:
+                        return _re.sub(
+                            r'@([0-9a-f]{8})@',
+                            lambda m: id_to_name_at[m.group(1)] if m.group(1) in id_to_name_at else m.group(0),
+                            line,
+                        )
+                    raw_lines = [_resolve_at(t) for t in raw_lines]
+            st_lines = raw_lines
+            return Routine(name, name, routine_type, [], [], {}, st_lines, st_ids)
 
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
