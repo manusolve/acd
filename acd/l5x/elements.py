@@ -1829,22 +1829,46 @@ class RoutineBuilder(L5xElementBuilder):
         )
 
         # ST routines store source lines in the nameless table, not in region_map/rungs.
+        # Source lines are nested several levels deep under the routine's nameless subtree.
+        # Records with seq=0xFFFFFFFF (buf[20:24]) are compiled ladder-equivalent
+        # representations and must be excluded; only records with a valid seq number are
+        # the actual ST source text.  We collect all descendants via a recursive CTE and
+        # then filter + sort in Python.
         if routine_type == "ST":
             from acd.record.nameless import parse_source_line
             import re as _re
             st_lines: List[str] = []
             st_ids: List[int] = []
             self._cur.execute(
-                "SELECT object_id, record FROM nameless WHERE parent_id=? ORDER BY rowid",
+                """
+                WITH RECURSIVE subtree(object_id, record) AS (
+                    SELECT object_id, record
+                    FROM nameless
+                    WHERE parent_id = ?
+                    UNION ALL
+                    SELECT n.object_id, n.record
+                    FROM nameless n
+                    JOIN subtree s ON n.parent_id = s.object_id
+                )
+                SELECT object_id, record FROM subtree
+                """,
                 (self._object_id,),
             )
             raw_lines: List[str] = []
+            candidates: List[tuple] = []
             for obj_id, blob in self._cur.fetchall():
-                line = parse_source_line(bytes(blob))
+                buf = bytes(blob)
+                line = parse_source_line(buf)
                 if line is None:
                     continue
-                raw_lines.append(line)
-                st_ids.append(obj_id)
+                seq = struct.unpack_from("<I", buf, 20)[0] if len(buf) >= 24 else 0xFFFFFFFF
+                if seq == 0xFFFFFFFF:
+                    # Compiled/ladder-equivalent record — not ST source text.
+                    continue
+                candidates.append((seq, obj_id, line))
+            candidates.sort(key=lambda x: x[0])
+            raw_lines = [c[2] for c in candidates]
+            st_ids = [c[1] for c in candidates]
             # Resolve @XXXXXXXX@ tag-reference placeholders to comp names.
             all_hex_at = set(
                 m for line in raw_lines for m in _re.findall(r'@([0-9a-f]{8})@', line)
