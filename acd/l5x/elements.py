@@ -1927,7 +1927,28 @@ class RoutineBuilder(L5xElementBuilder):
             ordered_oids = [o for _, grp in group_order for o in grp]
             raw_lines = [src_lines_info[o][2] for o in ordered_oids]
             st_ids = ordered_oids
-            # Resolve @XXXXXXXX@ tag-reference placeholders to comp names.
+            # Find the program that owns this routine so we can detect cross-program
+            # tag references and emit the required \ProgramName. prefix.
+            # Hierarchy: routine → RxRoutineCollection → Program → RxProgramCollection
+            routine_program_oid: int = -1
+            self._cur.execute(
+                """
+                SELECT p.object_id FROM comps r
+                JOIN comps rc ON r.parent_id = rc.object_id
+                JOIN comps p  ON rc.parent_id = p.object_id
+                WHERE r.object_id = ?
+                """,
+                (self._object_id,),
+            )
+            rp_row = self._cur.fetchone()
+            if rp_row:
+                routine_program_oid = rp_row[0]
+
+            # Resolve @XXXXXXXX@ tag-reference placeholders.
+            # For tags that belong to a *different* program than this routine,
+            # prefix with \ProgramName. (Logix cross-program reference syntax).
+            # Tags that are controller-scoped (no program ancestor) or belong to
+            # the same program are emitted without a prefix.
             all_hex_at = set(
                 m for line in raw_lines for m in _re.findall(r'@([0-9a-f]{8})@', line)
             )
@@ -1935,10 +1956,36 @@ class RoutineBuilder(L5xElementBuilder):
                 id_to_name_at: Dict[str, str] = {}
                 for hex_id in all_hex_at:
                     oid = int(hex_id, 16)
-                    self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (oid,))
+                    # 4-level join: tag → RxTagCollection → Program → RxProgramCollection
+                    # LEFT JOIN on the 4th level so controller-scoped tags (whose owner
+                    # has no further parent in the comps graph) still resolve correctly.
+                    self._cur.execute(
+                        """
+                        SELECT c.comp_name, gp.comp_name, gp.object_id, ggp.comp_name
+                        FROM comps c
+                        JOIN  comps tc  ON c.parent_id  = tc.object_id
+                        JOIN  comps gp  ON tc.parent_id = gp.object_id
+                        LEFT JOIN comps ggp ON gp.parent_id = ggp.object_id
+                        WHERE c.object_id = ?
+                        """,
+                        (oid,),
+                    )
                     row2 = self._cur.fetchone()
                     if row2:
-                        id_to_name_at[hex_id] = row2[0]
+                        tag_name, prog_name, prog_oid, ggp_name = row2
+                        is_program_tag = (ggp_name == "RxProgramCollection")
+                        if is_program_tag and prog_oid != routine_program_oid:
+                            id_to_name_at[hex_id] = f"\\{prog_name}.{tag_name}"
+                        else:
+                            id_to_name_at[hex_id] = tag_name
+                    else:
+                        # Fall back: simple comp_name lookup (no prefix)
+                        self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id=?", (oid,)
+                        )
+                        row3 = self._cur.fetchone()
+                        if row3:
+                            id_to_name_at[hex_id] = row3[0]
                 if id_to_name_at:
                     def _resolve_at(line: str) -> str:
                         return _re.sub(
@@ -1947,6 +1994,33 @@ class RoutineBuilder(L5xElementBuilder):
                             line,
                         )
                     raw_lines = [_resolve_at(t) for t in raw_lines]
+
+            # Second pass: resolve &hexoid: module references that may have been
+            # introduced by the @hex@ substitution above (IO module tag comp_names
+            # are stored as "&XXXXXXXX:slot:datatype" where XXXXXXXX is the module
+            # object_id).  Replace &hexoid: with the actual module comp_name.
+            all_hex_amp = set(
+                m for line in raw_lines for m in _re.findall(r'&([0-9a-f]{8}):', line)
+            )
+            if all_hex_amp:
+                id_to_mod: Dict[str, str] = {}
+                for hex_id in all_hex_amp:
+                    mod_oid = int(hex_id, 16)
+                    self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=?", (mod_oid,)
+                    )
+                    mod_row = self._cur.fetchone()
+                    if mod_row:
+                        id_to_mod[hex_id] = mod_row[0]
+                if id_to_mod:
+                    def _resolve_amp(line: str) -> str:
+                        return _re.sub(
+                            r'&([0-9a-f]{8}):',
+                            lambda m: (id_to_mod[m.group(1)] + ":") if m.group(1) in id_to_mod else m.group(0),
+                            line,
+                        )
+                    raw_lines = [_resolve_amp(t) for t in raw_lines]
+
             st_lines = raw_lines
             return Routine(name, name, routine_type, [], [], {}, st_lines, st_ids)
 
@@ -2297,6 +2371,10 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
+            # Skip internal Rockwell shadow tags (e.g. __SHADOW_XXXXXXXX).
+            # These are ACD-internal bookkeeping entries and should not be exported.
+            if result[0].startswith("__"):
+                continue
             tag = TagBuilder(self._cur, result[1]).build()
             tag._data_types_map = self._data_types_map
             tags.append(tag)
