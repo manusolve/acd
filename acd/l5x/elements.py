@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
@@ -752,9 +752,11 @@ class Routine(L5xElement):
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
+    st_lines: List[str] = field(default_factory=list)
+    _st_source_ids: List[int] = field(default_factory=list)
 
     def to_xml(self) -> str:
-        rll_content = ""
+        content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
             for i, rung_text in enumerate(self.rungs):
@@ -772,8 +774,14 @@ class Routine(L5xElement):
                     f'</Rung>'
                 )
             if rung_xmls:
-                rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
+                content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        elif self.type == "ST" and self.st_lines:
+            line_xmls = [
+                f'<Line Number="{i}"><![CDATA[{text}]]></Line>'
+                for i, text in enumerate(self.st_lines)
+            ]
+            content = f'<STContent>{"".join(line_xmls)}</STContent>'
+        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{content}</Routine>'
 
 
 @dataclass
@@ -1820,6 +1828,202 @@ class RoutineBuilder(L5xElementBuilder):
             struct.unpack_from("<H", r.record_buffer, 0x30)[0]
         )
 
+        # ST routines store source lines in the nameless table, not in region_map/rungs.
+        # Source lines are nested several levels deep under the routine's nameless subtree.
+        # Records with seq=0xFFFFFFFF (buf[20:24]) are compiled ladder-equivalent
+        # representations and must be excluded; only records with a valid seq number are
+        # the actual ST source text.  We collect all descendants via a recursive CTE and
+        # then filter + sort in Python.
+        if routine_type == "ST":
+            from acd.record.nameless import parse_source_line
+            from collections import defaultdict
+            import re as _re
+            st_lines: List[str] = []
+            st_ids: List[int] = []
+            # Fetch the full nameless subtree for this ST routine, including
+            # parent_id so we can reconstruct the ordered child-ID lists that
+            # the ACD stores inside parent blobs.
+            self._cur.execute(
+                """
+                WITH RECURSIVE subtree(object_id, parent_id, record) AS (
+                    SELECT object_id, parent_id, record
+                    FROM nameless
+                    WHERE parent_id = ?
+                    UNION ALL
+                    SELECT n.object_id, n.parent_id, n.record
+                    FROM nameless n
+                    JOIN subtree s ON n.parent_id = s.object_id
+                )
+                SELECT object_id, parent_id, record FROM subtree
+                """,
+                (self._object_id,),
+            )
+            raw_lines: List[str] = []
+            # node_buf: oid → raw bytes for all subtree nodes (needed to read
+            # the ordered child-ID lists stored in parent blobs).
+            node_buf: Dict[int, bytes] = {}
+            # src_lines_info: oid → (seq, parent_oid, line_text) for real ST source lines
+            src_lines_info: Dict[int, tuple] = {}
+            for obj_id, par_id, blob in self._cur.fetchall():
+                buf = bytes(blob)
+                node_buf[obj_id] = buf
+                line = parse_source_line(buf)
+                if line is None:
+                    continue
+                seq = struct.unpack_from("<I", buf, 20)[0] if len(buf) >= 24 else 0xFFFFFFFF
+                if seq == 0xFFFFFFFF:
+                    # Compiled/ladder-equivalent record — not ST source text.
+                    continue
+                src_lines_info[obj_id] = (seq, par_id, line)
+
+            # Determine display order using the ordered child-ID list embedded in
+            # the parent blob.  The ACD stores display order as:
+            #   parent_buf[24:26]  = uint16 LE count of children
+            #   parent_buf[26:26+count*4] = child OIDs in display order
+            # This list is authoritative; the `seq` field is a global edit
+            # counter and does NOT encode display position (lines edited or
+            # re-inserted after initial creation get a later seq number but
+            # keep their original position in the ordered list).
+            #
+            # Strategy:
+            #  1. Group source lines by their direct parent OID.
+            #  2. For each parent, try to read the embedded ordered ID list.
+            #     If all children are covered, use that order.
+            #  3. Fall back to seq-sorting per group when no embedded list is
+            #     found (works for simple routines where lines were typed in
+            #     order and never re-ordered).
+            #  4. Sort groups by minimum seq so inter-group ordering is stable.
+
+            def _ordered_for_parent(par_oid: int, child_oids: List[int]) -> List[int]:
+                """Return child_oids in display order using parent blob or seq fallback."""
+                child_set = set(child_oids)
+                if par_oid in node_buf:
+                    pbuf = node_buf[par_oid]
+                    if len(pbuf) >= 26:
+                        count = struct.unpack_from("<H", pbuf, 24)[0]
+                        if count == len(child_set) and 26 + count * 4 <= len(pbuf):
+                            ids = [
+                                struct.unpack_from("<I", pbuf, 26 + i * 4)[0]
+                                for i in range(count)
+                            ]
+                            if set(ids) == child_set:
+                                return ids
+                # Fall back: sort by seq
+                return sorted(child_oids, key=lambda o: src_lines_info[o][0])
+
+            # Group source lines by parent
+            groups: Dict[int, List[int]] = defaultdict(list)
+            for src_oid, (seq, par_id, _) in src_lines_info.items():
+                groups[par_id].append(src_oid)
+
+            # Build final ordered list, sorting groups by minimum seq
+            group_order: List[tuple] = []
+            for par_oid, child_oids in groups.items():
+                min_seq = min(src_lines_info[o][0] for o in child_oids)
+                ordered = _ordered_for_parent(par_oid, child_oids)
+                group_order.append((min_seq, ordered))
+            group_order.sort(key=lambda g: g[0])
+
+            ordered_oids = [o for _, grp in group_order for o in grp]
+            raw_lines = [src_lines_info[o][2] for o in ordered_oids]
+            st_ids = ordered_oids
+            # Find the program that owns this routine so we can detect cross-program
+            # tag references and emit the required \ProgramName. prefix.
+            # Hierarchy: routine → RxRoutineCollection → Program → RxProgramCollection
+            routine_program_oid: int = -1
+            self._cur.execute(
+                """
+                SELECT p.object_id FROM comps r
+                JOIN comps rc ON r.parent_id = rc.object_id
+                JOIN comps p  ON rc.parent_id = p.object_id
+                WHERE r.object_id = ?
+                """,
+                (self._object_id,),
+            )
+            rp_row = self._cur.fetchone()
+            if rp_row:
+                routine_program_oid = rp_row[0]
+
+            # Resolve @XXXXXXXX@ tag-reference placeholders.
+            # For tags that belong to a *different* program than this routine,
+            # prefix with \ProgramName. (Logix cross-program reference syntax).
+            # Tags that are controller-scoped (no program ancestor) or belong to
+            # the same program are emitted without a prefix.
+            all_hex_at = set(
+                m for line in raw_lines for m in _re.findall(r'@([0-9a-f]{8})@', line)
+            )
+            if all_hex_at:
+                id_to_name_at: Dict[str, str] = {}
+                for hex_id in all_hex_at:
+                    oid = int(hex_id, 16)
+                    # 4-level join: tag → RxTagCollection → Program → RxProgramCollection
+                    # LEFT JOIN on the 4th level so controller-scoped tags (whose owner
+                    # has no further parent in the comps graph) still resolve correctly.
+                    self._cur.execute(
+                        """
+                        SELECT c.comp_name, gp.comp_name, gp.object_id, ggp.comp_name
+                        FROM comps c
+                        JOIN  comps tc  ON c.parent_id  = tc.object_id
+                        JOIN  comps gp  ON tc.parent_id = gp.object_id
+                        LEFT JOIN comps ggp ON gp.parent_id = ggp.object_id
+                        WHERE c.object_id = ?
+                        """,
+                        (oid,),
+                    )
+                    row2 = self._cur.fetchone()
+                    if row2:
+                        tag_name, prog_name, prog_oid, ggp_name = row2
+                        is_program_tag = (ggp_name == "RxProgramCollection")
+                        if is_program_tag and prog_oid != routine_program_oid:
+                            id_to_name_at[hex_id] = f"\\{prog_name}.{tag_name}"
+                        else:
+                            id_to_name_at[hex_id] = tag_name
+                    else:
+                        # Fall back: simple comp_name lookup (no prefix)
+                        self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id=?", (oid,)
+                        )
+                        row3 = self._cur.fetchone()
+                        if row3:
+                            id_to_name_at[hex_id] = row3[0]
+                if id_to_name_at:
+                    def _resolve_at(line: str) -> str:
+                        return _re.sub(
+                            r'@([0-9a-f]{8})@',
+                            lambda m: id_to_name_at[m.group(1)] if m.group(1) in id_to_name_at else m.group(0),
+                            line,
+                        )
+                    raw_lines = [_resolve_at(t) for t in raw_lines]
+
+            # Second pass: resolve &hexoid: module references that may have been
+            # introduced by the @hex@ substitution above (IO module tag comp_names
+            # are stored as "&XXXXXXXX:slot:datatype" where XXXXXXXX is the module
+            # object_id).  Replace &hexoid: with the actual module comp_name.
+            all_hex_amp = set(
+                m for line in raw_lines for m in _re.findall(r'&([0-9a-f]{8}):', line)
+            )
+            if all_hex_amp:
+                id_to_mod: Dict[str, str] = {}
+                for hex_id in all_hex_amp:
+                    mod_oid = int(hex_id, 16)
+                    self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=?", (mod_oid,)
+                    )
+                    mod_row = self._cur.fetchone()
+                    if mod_row:
+                        id_to_mod[hex_id] = mod_row[0]
+                if id_to_mod:
+                    def _resolve_amp(line: str) -> str:
+                        return _re.sub(
+                            r'&([0-9a-f]{8}):',
+                            lambda m: (id_to_mod[m.group(1)] + ":") if m.group(1) in id_to_mod else m.group(0),
+                            line,
+                        )
+                    raw_lines = [_resolve_amp(t) for t in raw_lines]
+
+            st_lines = raw_lines
+            return Routine(name, name, routine_type, [], [], {}, st_lines, st_ids)
+
         self._cur.execute(
             "SELECT rm.object_id, r.rung FROM region_map rm "
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
@@ -2167,6 +2371,10 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
+            # Skip internal Rockwell shadow tags (e.g. __SHADOW_XXXXXXXX).
+            # These are ACD-internal bookkeeping entries and should not be exported.
+            if result[0].startswith("__"):
+                continue
             tag = TagBuilder(self._cur, result[1]).build()
             tag._data_types_map = self._data_types_map
             tags.append(tag)
