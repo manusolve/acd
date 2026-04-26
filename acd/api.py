@@ -8,6 +8,7 @@ from os import PathLike
 from pathlib import Path
 
 from acd.l5x.export_l5x import ExportL5x
+from acd.l5x.xplode import xplode
 from acd.zip.unzip import Unzip
 from acd.zip.write_acd import write_acd
 from acd.zip.write_dat import patch_sbregion_dat
@@ -253,3 +254,36 @@ class ConvertAcdToL5x(Extract):
             output = raw_xml
         with open(self.l5x_filename, "w", encoding="utf-8") as f:
             f.write(output)
+
+
+@dataclass
+class ExplodeAcdToTree(Extract):
+    """Explode an ACD file to a version-control-friendly filesystem tree.
+
+    Reads the ACD binary databases and writes each logical element
+    (DataType, Module, Tag, Program, Routine, AOI, Task) to its own
+    file under ``output_directory/RSLogix5000Content/``, mirroring the
+    directory structure produced by the Logix SDK ``xplode`` command.
+
+    ST routines are written as plain ``.st`` text files containing the
+    raw source text — one file per routine, directly ``git diff``-able.
+    All other elements are written as pretty-printed XML files.
+
+    Intended workflow::
+
+        ExplodeAcdToTree("MyProject.ACD", "myproject-tree/").extract()
+        # Commit the resulting tree to git.
+        # On the next firmware revision, run again and use `git diff`
+        # to see exactly which routines, tags, or data types changed.
+
+    :param PathLike acd_filename: Path to the source .ACD file.
+    :param PathLike output_directory: Root directory for the output tree.
+        The ``RSLogix5000Content`` sub-directory is created inside it.
+    """
+
+    acd_filename: PathLike
+    output_directory: PathLike
+
+    def extract(self):
+        project = load_acd(str(self.acd_filename))
+        xplode(project, str(self.output_directory))

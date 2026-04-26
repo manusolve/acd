@@ -151,8 +151,11 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
 }
 
 # Radix string used in Decorated DataValueMember for each numeric primitive.
-# BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".
+# BOOL uses Radix="Decimal" in Logix L5X output. REAL/LREAL use "Float"; all
+# integers use "Decimal". BIT is treated like BOOL.
 _PRIMITIVE_RADIX: Dict[str, str] = {
+    "BOOL":  "Decimal",
+    "BIT":   "Decimal",
     "SINT":  "Decimal",
     "INT":   "Decimal",
     "DINT":  "Decimal",
@@ -201,7 +204,22 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 }
 
 # Types for which we emit no Decorated element at all (they use other formats).
-_SKIP_DECORATED: set = {"ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED"}
+_SKIP_DECORATED: set = {
+    "ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED",
+    # Axis and motion-group tags use Format="Axis" / Format="MotionGroup" — not Decorated.
+    "AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE", "MOTION_GROUP",
+}
+
+# Types for which we omit the Constant attribute entirely.
+_NO_CONSTANT_TYPES: frozenset = frozenset({"AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE", "MOTION_GROUP"})
+
+# Mapping from the raw usage byte (raw_rec[0x268]) to L5X Usage string.
+_USAGE_BYTE_MAP: Dict[int, str] = {
+    0x06: "Input",
+    0x0A: "Output",
+    0x0C: "InOut",
+    0x16: "Public",
+}
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -334,12 +352,16 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     if dt_base in _SKIP_DECORATED:
         return ""
 
+    # Preserve the original-case DataType name for XML output (e.g. "TimerStart" not "TIMERSTART").
+    dt_obj = data_types_map.get(dt_base)
+    dt_display = dt_obj.name if dt_obj else dt_base
+
     if dimensions is None:
         # Scalar struct
         inner = _struct_members_xml(dt_base, data_types_map)
         if inner is None:
             return ""
-        body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+        body = f'<Structure DataType="{dt_display}">{inner}</Structure>'
     else:
         # Array tag: parse dimensions (up to 3D, comma-separated)
         dim_parts = [int(d) for d in dimensions.split(",") if d.strip().isdigit()]
@@ -388,7 +410,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             inner = _struct_members_xml(dt_base, data_types_map)
             if inner is None:
                 return ""
-            struct_xml = f'<Structure DataType="{dt_base}">{inner}</Structure>'
+            struct_xml = f'<Structure DataType="{dt_display}">{inner}</Structure>'
 
             def _struct_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
@@ -398,7 +420,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
                     _struct_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
                 )
             elems = _struct_elems([], dim_parts)
-            body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}">{elems}</Array>'
+            body = f'<Array DataType="{dt_display}" Dimensions="{dim_str}">{elems}</Array>'
 
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
@@ -406,12 +428,15 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
 @dataclass
 class Tag(L5xElement):
     name: str
-    tag_type: str
-    data_type: str
-    radix: Union[str, None]
-    external_access: str
-    constant: Union[str, None]  # "true" for constants; None omits the attribute
+    cls: Union[str, None]        # Class="Standard"/"Safety" (controller-scope Base only)
+    tag_type: str                # "Base" or "Alias"
+    data_type: Union[str, None]  # None for Alias tags (omits the attribute)
     dimensions: Union[str, None]
+    radix: Union[str, None]
+    alias_for: Union[str, None]  # AliasFor=... (Alias tags only)
+    usage: Union[str, None]      # "Input"/"Output"/"InOut"/"Public" (program-scope only)
+    constant: Union[str, None]   # "true"/"false" for Base; None omits the attribute
+    external_access: str
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -447,6 +472,10 @@ class Tag(L5xElement):
     def to_xml(self) -> str:
         base = super().to_xml()
 
+        # Alias tags and InOut parameters carry no data value.
+        if self.tag_type == "Alias" or self.usage == "InOut":
+            return base
+
         # --- Description child element ---
         # Find tag-level description: empty tag_reference means the tag itself.
         # Tags with multiple empty-ref entries (e.g. array-element bit descriptions
@@ -458,16 +487,26 @@ class Tag(L5xElement):
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
         # --- Data child element(s) ---
-        # Scalar primitives get Format="L5K" only.
-        # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
-        # nothing here — Decorated is not used for scalar STRING tags).
-        # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
+        # L5X always emits both Format="L5K" and Format="Decorated" for all tag types.
+        # STRING tags are emitted as L5K only (Decorated not used for raw STRING tags).
+        # We generate zero-initialised L5K values; actual stored values require binary
+        # tag-data decoding which is not yet implemented.
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
         l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
-        data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+        data_xml = ""
 
-        if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
-            # Generate Decorated data for non-primitive / array types
+        if l5k_zero is not None:
+            # Scalar primitive: L5K + Decorated DataValue
+            radix = _PRIMITIVE_RADIX.get(dt_base)
+            radix_attr = f' Radix="{radix}"' if radix else ""
+            data_xml = (
+                f'<Data Format="L5K"><![CDATA[{l5k_zero}]]></Data>'
+                f'<Data Format="Decorated">\n'
+                f'<DataValue DataType="{self.data_type}"{radix_attr} Value="0" />\n'
+                f'</Data>'
+            )
+        elif dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+            # Non-primitive / array types: generate Decorated data
             decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
             if decorated:
                 data_xml = decorated
@@ -507,11 +546,28 @@ class LocalTag(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        desc_xml = ""
+        if self._description:
+            desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+
+        # DefaultData: emitted for scalar primitive local tags.
+        default_xml = ""
+        if not self.dimensions:
+            dt_upper = self.data_type.upper() if self.data_type else ""
+            l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_upper)
+            if l5k_zero is not None:
+                radix_attr = f' Radix="{self.radix}"' if self.radix else ""
+                default_xml = (
+                    f'<DefaultData Format="L5K"><![CDATA[{l5k_zero}]]></DefaultData>'
+                    f'<DefaultData Format="Decorated">\n'
+                    f'<DataValue DataType="{self.data_type}"{radix_attr} Value="0" />\n'
+                    f'</DefaultData>'
+                )
+
+        if not desc_xml and not default_xml:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + default_xml + base[idx + 1:]
 
 
 @dataclass
@@ -528,6 +584,8 @@ class Parameter(L5xElement):
     constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
     _description: Union[str, None] = field(default=None)
+    # True for system-defined parameters (EnableIn/EnableOut) which never carry DefaultData.
+    _is_system_param: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -542,11 +600,29 @@ class Parameter(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        desc_xml = ""
+        if self._description:
+            desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+
+        # DefaultData: emitted for all non-InOut scalar primitive parameters that are
+        # not system-defined (EnableIn/EnableOut never have DefaultData).
+        default_xml = ""
+        if self.usage != "InOut" and not self.dimensions and not self._is_system_param:
+            dt_upper = self.data_type.upper() if self.data_type else ""
+            l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_upper)
+            if l5k_zero is not None:
+                radix_attr = f' Radix="{self.radix}"' if self.radix else ""
+                default_xml = (
+                    f'<DefaultData Format="L5K"><![CDATA[{l5k_zero}]]></DefaultData>'
+                    f'<DefaultData Format="Decorated">\n'
+                    f'<DataValue DataType="{self.data_type}"{radix_attr} Value="0" />\n'
+                    f'</DefaultData>'
+                )
+
+        if not desc_xml and not default_xml:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + default_xml + base[idx + 1:]
 
 
 @dataclass
@@ -787,6 +863,7 @@ class Routine(L5xElement):
 @dataclass
 class AOI(L5xElement):
     name: str
+    cls: Union[str, None]        # Class="Standard"/"Safety"; None omits attribute
     revision: str
     revision_extension: Union[str, None]  # None if absent (omitted from XML)
     vendor: Union[str, None]  # None if absent (omitted from XML)
@@ -826,6 +903,7 @@ class Program(L5xElement):
     main_routine_name: Union[str, None]  # None if absent (omitted from XML)
     fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
     disabled: str
+    cls: Union[str, None]              # Class="Standard"/"Safety"; None omits attribute
     synchronize_redundancy_data_after_execution: Union[str, None]  # None → omit attr
     use_as_folder: str
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
@@ -860,6 +938,7 @@ class Task(L5xElement):
     watchdog: str
     disable_update_outputs: str
     inhibit_task: str
+    cls: Union[str, None]   # Class="Standard"/"Safety"; None omits attribute
     event_info: Union[EventInfo, None]  # None for non-EVENT tasks
     scheduled_programs: List[ScheduledProgram]
 
@@ -1512,34 +1591,43 @@ class ModuleBuilder(L5xElementBuilder):
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    _controller_scope: bool = field(default=False)
+
     def build(self) -> Tag:
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
+            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE object_id="
             + str(self._object_id)
         )
         results = self._cur.fetchall()
 
-        # Extract ExternalAccess and Constant from the raw record at fixed offsets:
-        #   raw[0x278]: ExternalAccess enum (0=Read/Write, 2=Read Only, 3=None)
-        #   raw[0x279]: Constant flag (0=false, 1=true)
-        raw_rec = bytes(results[0][3])
+        raw_rec = bytes(results[0][4])
+        record_type = results[0][3]
+
+        # ExternalAccess from raw_rec[0x278]; Constant flag from raw_rec[0x279].
         if len(raw_rec) > 0x279:
             external_access = external_access_enum(raw_rec[0x278])
-            constant = "true" if raw_rec[0x279] else None
+            _constant_flag = raw_rec[0x279]
         else:
             external_access = "Read/Write"
-            constant = None
+            _constant_flag = 0
+
+        # Usage (program-scope only): raw_rec[0x268] encodes Input/Output/InOut/Public.
+        usage: Union[str, None] = None
+        if not self._controller_scope and len(raw_rec) > 0x268:
+            usage = _USAGE_BYTE_MAP.get(raw_rec[0x268])
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
-        except Exception as e:
+        except Exception:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], None, "Base", "", None, None, None, None, None,
+                external_access, 0, [],
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], None, "Base", "", None, None, None, None, None,
+                external_access, 0, [],
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -1563,29 +1651,9 @@ class TagBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        if 0x01 not in extended_records:
-            # Name comes from comp_name in the database; radix from main_record
-            raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix)
-            dim_parts = []
-            if r.main_record.dimension_1 != 0:
-                dim_parts.append(str(r.main_record.dimension_1))
-            if r.main_record.dimension_2 != 0:
-                dim_parts.append(str(r.main_record.dimension_2))
-            if r.main_record.dimension_3 != 0:
-                dim_parts.append(str(r.main_record.dimension_3))
-            dimensions = ",".join(dim_parts) if dim_parts else None
-            return Tag(
-                results[0][0], results[0][0], "Base", data_type, radix,
-                external_access, constant, dimensions, r.main_record.data_table_instance,
-                comment_results,
-            )
-
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
-
+        # Radix: 0 means no radix (UDT/AXIS/MOTION); emit None (omit attribute).
         raw_radix = r.main_record.radix
-        radix = radix_enum(raw_radix)
+        radix = radix_enum(raw_radix) if raw_radix != 0 else None
 
         dim_parts = []
         if r.main_record.dimension_1 != 0:
@@ -1595,17 +1663,67 @@ class TagBuilder(L5xElementBuilder):
         if r.main_record.dimension_3 != 0:
             dim_parts.append(str(r.main_record.dimension_3))
         dimensions = ",".join(dim_parts) if dim_parts else None
+
+        # Determine tag name: from ext[0x01] if present, else from comp_name.
+        if 0x01 in extended_records:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            name = bytes(extended_records[0x01][2: name_length + 2]).decode("utf-8", errors="replace")
+        else:
+            name = results[0][0]
+
+        # Alias detection: if data_table_instance points to an I/O module tag
+        # (comp_name starting with "&"), this is an Alias tag.
+        dti = r.main_record.data_table_instance
+        self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(dti))
+        dti_row = self._cur.fetchone()
+        if dti_row and dti_row[0].startswith("&"):
+            # Build AliasFor string from the I/O module tag name "&{mod_hex}:{slot}:{dir}"
+            io_comp_name = dti_row[0]  # e.g. "&712265c0:10:I"
+            parts = io_comp_name[1:].split(":")
+            alias_for: Union[str, None] = io_comp_name  # fallback
+            if len(parts) >= 3:
+                module_hex, slot, direction = parts[0], parts[1], parts[2]
+                try:
+                    module_oid = int(module_hex, 16)
+                    self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=" + str(module_oid)
+                    )
+                    mod_row = self._cur.fetchone()
+                    module_name = mod_row[0] if mod_row else module_hex
+                    # For scalar BOOL: append the bit-offset from raw_rec[0x043].
+                    # Safety POINT-IO (cip_type=0x68) uses "Pt{NN}Data" member names;
+                    # standard I/O (cip_type=0x6B) uses plain numeric bit-offset.
+                    if data_type == "BOOL" and r.main_record.dimension_1 == 0 and len(raw_rec) > 0x043:
+                        bit_offset = raw_rec[0x043]
+                        if r.cip_type == 0x68:
+                            alias_for = f"{module_name}:{slot}:{direction}.Pt{bit_offset:02d}Data"
+                        else:
+                            alias_for = f"{module_name}:{slot}:{direction}.{bit_offset}"
+                    else:
+                        alias_for = f"{module_name}:{slot}:{direction}"
+                except (ValueError, TypeError):
+                    pass
+            return Tag(
+                name, name, None, "Alias", None, None, radix, alias_for, None, None,
+                external_access, 0, [],
+            )
+
+        # --- Base tag ---
+        dt_upper = data_type.upper() if data_type else ""
+
+        # Class: controller-scope Base tags get Standard/Safety; program-scope omit.
+        cls: Union[str, None] = None
+        if self._controller_scope and data_type:
+            cls = "Safety" if record_type == 257 else "Standard"
+
+        # Constant: omit for Axis/Motion types and when there is no data_type.
+        constant: Union[str, None] = None
+        if data_type and dt_upper not in _NO_CONSTANT_TYPES:
+            constant = "true" if _constant_flag else "false"
+
         return Tag(
-            name,
-            name,
-            "Base",
-            data_type,
-            radix,
-            external_access,
-            constant,
-            dimensions,
-            r.main_record.data_table_instance,
-            comment_results,
+            name, name, cls, "Base", data_type, dimensions, radix, None, usage, constant,
+            external_access, dti, comment_results,
         )
 
 
@@ -1639,11 +1757,12 @@ class ParameterBuilder(L5xElementBuilder):
 
     def build(self) -> Parameter:
         self._cur.execute(
-            "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
+            "SELECT comp_name, record, record_type FROM comps WHERE object_id=" + str(self._object_id)
         )
         row = self._cur.fetchone()
         name = row[0]
         raw_rec = bytes(row[1])
+        is_system_param = row[2] in (1284, 1285)
 
         data_type = _aoi_tag_data_type(self._cur, raw_rec)
 
@@ -1660,7 +1779,8 @@ class ParameterBuilder(L5xElementBuilder):
                 er.attribute_id: bytes(er.value) for er in r.extended_records
             }
         except Exception:
-            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
+            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions,
+                             _is_system_param=is_system_param)
 
         ext01 = exts.get(0x01, b"")
         flags = _aoi_tag_usage_flags(ext01)
@@ -1727,6 +1847,7 @@ class ParameterBuilder(L5xElementBuilder):
             constant,
             dimensions,
             description,
+            _is_system_param=is_system_param,
         )
 
 
@@ -2162,6 +2283,7 @@ class AoiBuilder(L5xElementBuilder):
 
         # --- Revision (major.minor) from ext[0x01] ---
         _r_aoi: Union[RxGeneric, None] = None
+        e01: bytes = b""
         try:
             r = RxGeneric.from_bytes(aoi_record)
             _r_aoi = r
@@ -2202,13 +2324,25 @@ class AoiBuilder(L5xElementBuilder):
         tag_coll_row = self._cur.fetchone()
         if tag_coll_row:
             tag_coll_oid = tag_coll_row[0]
+            # Two-pass fetch: system params (record_type 1284/1285, i.e. EnableIn/EnableOut)
+            # first ordered by name so EnableIn precedes EnableOut, then all other children
+            # in their natural rowid/insertion order.  Using a single ORDER BY seq_number
+            # produces unstable ordering because all items share the same seq_number value.
             self._cur.execute(
                 "SELECT object_id, record FROM comps WHERE parent_id="
                 + str(tag_coll_oid)
-                + " AND record_type != 512"
-                + " ORDER BY seq_number"
+                + " AND record_type IN (1284, 1285)"
+                + " ORDER BY comp_name"
             )
-            for child_oid, child_rec in self._cur.fetchall():
+            system_rows = self._cur.fetchall()
+            self._cur.execute(
+                "SELECT object_id, record FROM comps WHERE parent_id="
+                + str(tag_coll_oid)
+                + " AND record_type NOT IN (512, 1284, 1285)"
+            )
+            other_rows = self._cur.fetchall()
+
+            for child_oid, child_rec in list(system_rows) + list(other_rows):
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag by inspecting
                 # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
@@ -2278,7 +2412,10 @@ class AoiBuilder(L5xElementBuilder):
                 pass
 
         return AOI(
-            name, name, revision,
+            name, name,
+            # Class: Safety if e01[0x07c] has bit 0x02 set, else Standard.
+            "Safety" if (len(e01) > 0x07C and e01[0x07C] & 0x02) else "Standard",
+            revision,
             meta["revision_extension"],
             vendor,
             "false", "false", "false",
@@ -2390,8 +2527,12 @@ class ProgramBuilder(L5xElementBuilder):
         # for all programs in a redundant controller project.
         sync_redundancy = "true" if self._redundancy_enabled else None
 
+        # Class: "Safety" if ext[0x01] byte 0x018 == 0x01, else "Standard".
+        is_safety_prog = len(ext01) > 0x018 and ext01[0x018] == 0x01
+        cls = "Safety" if is_safety_prog else "Standard"
+
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, "false", tags, routines)
+                       disabled, cls, sync_redundancy, "false", tags, routines)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -2399,7 +2540,8 @@ _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 
 @dataclass
 class TaskBuilder(L5xElementBuilder):
-    def build(self, comment_id_to_program: Dict[int, str]) -> Task:
+    def build(self, comment_id_to_program: Dict[int, str],
+              safety_prog_comment_ids: "frozenset[int] | None" = None) -> Task:
         self._cur.execute(
             "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
         )
@@ -2421,15 +2563,23 @@ class TaskBuilder(L5xElementBuilder):
         # Format: u16 count followed by N u32 comment_ids.
         prog_count = struct.unpack_from("<H", record, 0x5A)[0]
         scheduled_programs = []
+        scheduled_comment_ids: list = []
         for i in range(prog_count):
             cid = struct.unpack_from("<I", record, 0x5A + 2 + i * 4)[0]
             prog_name = comment_id_to_program.get(cid)
             if prog_name:
                 scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
+                scheduled_comment_ids.append(cid)
 
         event_info = None
         if task_type == "EVENT":
             event_info = EventInfo("EventInfo", "EVENT Instruction Only", "false")
+
+        # Class: "Safety" if any scheduled program is a safety program, else "Standard".
+        _safety_ids = safety_prog_comment_ids or frozenset()
+        cls: Union[str, None] = "Safety" if any(
+            cid in _safety_ids for cid in scheduled_comment_ids
+        ) else "Standard"
 
         return Task(
             name,
@@ -2440,6 +2590,7 @@ class TaskBuilder(L5xElementBuilder):
             str(watchdog_us // 1000),
             "true" if disable_update else "false",
             "false",
+            cls,
             event_info,
             scheduled_programs,
         )
@@ -2594,9 +2745,9 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id).build()
+            tag = TagBuilder(self._cur, _tag_object_id, True).build()
             tag._data_types_map = data_types_map
-            if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
+            if (tag.data_type or tag.tag_type == "Alias") and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
 
         # Get the Program Collection and get the programs
@@ -2622,15 +2773,26 @@ class ControllerBuilder(L5xElementBuilder):
                 ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
             )
 
-        # Build comment_id → program name map for task scheduled-program resolution.
-        # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.
+        # Build comment_id → program name map and safety-program comment-id set for
+        # task scheduled-program resolution.  comment_id is a u16 at BLOB offset 0x0C.
         self._cur.execute(
             "SELECT comp_name, record FROM comps WHERE parent_id=" + str(_program_collection_object_id)
         )
-        comment_id_to_program: Dict[int, str] = {
-            struct.unpack_from("<H", rec, 0x0C)[0]: pname
-            for pname, rec in self._cur.fetchall()
-        }
+        comment_id_to_program: Dict[int, str] = {}
+        safety_prog_comment_ids: frozenset = frozenset()
+        _safety_ids: list = []
+        for pname, rec in self._cur.fetchall():
+            cid = struct.unpack_from("<H", bytes(rec), 0x0C)[0]
+            comment_id_to_program[cid] = pname
+            try:
+                _pr = RxGeneric.from_bytes(bytes(rec))
+                _exts = {e.attribute_id: bytes(e.value) for e in _pr.extended_records}
+                _ext01 = _exts.get(0x01, b"")
+                if len(_ext01) > 0x018 and _ext01[0x018] == 0x01:
+                    _safety_ids.append(cid)
+            except Exception:
+                pass
+        safety_prog_comment_ids = frozenset(_safety_ids)
 
         # Get the Task Collection and build Tasks
         self._cur.execute(
@@ -2648,7 +2810,9 @@ class ControllerBuilder(L5xElementBuilder):
                 + " AND record_type=256"
             )
             for task_result in self._cur.fetchall():
-                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+                tasks.append(TaskBuilder(self._cur, task_result[1]).build(
+                    comment_id_to_program, safety_prog_comment_ids
+                ))
 
         # Get the AOI Collection and get the AOIs
         self._cur.execute(
