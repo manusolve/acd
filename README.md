@@ -95,7 +95,10 @@ patch_rungs(project, changes)
 
 `patch_rungs` rewrites the rung text inside the in-memory `SbRegion.Dat` binary blob.  Tag names
 in the new rung text are written as plain identifiers; the library resolves them back to the
-internal `@HEX@` object-ID placeholders automatically.
+internal `@hex@` object-ID placeholders automatically.
+
+> **Note** — `_rung_ids` is an internal attribute on `Routine` that exposes the ordered list of
+> rung object IDs needed by `patch_rungs`.  There is currently no higher-level public accessor.
 
 **Write the modified project back to an ACD file:**
 
