@@ -111,6 +111,72 @@ modified, so Studio 5000 can open it normally.
 
 ---
 
+### Explode ACD to a version-control-friendly folder tree
+
+`ExplodeAcdToTree` (backed by `acd.l5x.xplode.xplode`) mirrors the directory structure
+produced by the Rockwell Logix SDK `xplode` command.  Every logical element — DataType,
+Module, Tag, Program, Routine, AOI, Task — is written to its own file, making the output
+directly `git diff`-able across firmware versions.
+
+> **Note** — This feature is currently on the `feat/fix-l5x-bonefide-serialization-gaps`
+> branch and has not yet been merged to `main`.
+
+```python
+from acd.api import ExplodeAcdToTree
+
+ExplodeAcdToTree("MyController.ACD", "myproject-tree/").extract()
+```
+
+The resulting tree looks like:
+
+```
+myproject-tree/
+└── RSLogix5000Content/
+    ├── RSLogix5000Content.xml          # controller stub (empty collections)
+    ├── export-options.yaml
+    ├── DataTypes/
+    │   └── {TypeName}.xml
+    ├── Modules/
+    │   └── {ModuleName}.xml
+    ├── Tags/
+    │   └── {TagName}.xml               # controller-scoped tags
+    ├── Tasks/
+    │   └── {TaskName}.xml
+    ├── AddOnInstructionDefinitions/
+    │   └── {AoiName}/
+    │       ├── {AoiName}.xml           # AOI stub (Parameters + LocalTags)
+    │       └── Routines/
+    │           ├── {RoutineName}.st    # ST routines as plain text
+    │           └── {RoutineName}.xml   # RLL / other routines as XML
+    └── Programs/
+        └── {ProgramName}/
+            ├── {ProgramName}.xml       # program stub (empty Tags + Routines)
+            ├── Tags/
+            │   └── {TagName}.xml       # program-scoped tags
+            └── Routines/
+                ├── {RoutineName}.st
+                └── {RoutineName}.xml
+```
+
+ST routines are written as plain `.st` text files (raw source lines, no XML wrapper) so
+they produce clean `git diff` output.  All other elements are written as pretty-printed XML.
+Rung `Number` attributes are omitted to match the SDK `xplode` format.
+
+Volatile timestamps (`ExportDate`, `LastModifiedDate`) are stripped from the root XML so
+they do not create noise in version-controlled diffs.
+
+You can also call the underlying function directly:
+
+```python
+from acd.api import load_acd
+from acd.l5x.xplode import xplode
+
+project = load_acd("MyController.ACD")
+xplode(project, "myproject-tree/")
+```
+
+---
+
 ### Convert ACD to L5X
 
 Export the parsed project as an L5X XML file (importable by Studio 5000):
@@ -205,10 +271,11 @@ project    = export.project
 
 ```
 acd/
-├── api.py                  # Public API (ImportProjectFromFile, ConvertAcdToL5x, ...)
+├── api.py                  # Public API (ImportProjectFromFile, ConvertAcdToL5x, ExplodeAcdToTree, ...)
 ├── l5x/
 │   ├── export_l5x.py       # ACD -> SQLite -> Python objects
-│   └── elements.py         # Dataclasses + Builder classes for all project elements
+│   ├── elements.py         # Dataclasses + Builder classes for all project elements
+│   └── xplode.py           # Filesystem tree writer (mirrors Logix SDK xplode output)
 ├── database/               # Binary .Dat file reader
 ├── record/                 # Record parsers (Comps, SbRegion, Comments, Nameless)
 ├── generated/              # Kaitai Struct generated parsers (comps, comments, ...)
