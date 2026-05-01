@@ -64,6 +64,50 @@ for module in controller.map_devices:
 
 ---
 
+### Load, modify and save an ACD file
+
+`load_acd` / `save_acd` / `patch_rungs` provide a round-trip workflow for reading and writing ACD
+files directly, without going through the L5X intermediate format.
+
+**Load a project into memory:**
+
+```python
+from acd.api import load_acd, save_acd, patch_rungs
+
+project = load_acd("MyController.ACD")
+controller = project.controller
+```
+
+`load_acd` extracts and parses the ACD archive in a temporary directory (cleaned up automatically)
+and returns an `RSLogix5000Content` object with the full controller tree.
+
+**Modify ladder rung logic:**
+
+```python
+# Find the rung you want to change
+routine = controller.programs[0].routines[0]
+print(routine._rung_ids)   # list of integer object_ids, one per rung
+
+# Build a change map and apply it
+changes = {routine._rung_ids[0]: "XIC(MyTag)OTE(OutputTag);"}
+patch_rungs(project, changes)
+```
+
+`patch_rungs` rewrites the rung text inside the in-memory `SbRegion.Dat` binary blob.  Tag names
+in the new rung text are written as plain identifiers; the library resolves them back to the
+internal `@HEX@` object-ID placeholders automatically.
+
+**Write the modified project back to an ACD file:**
+
+```python
+save_acd(project, "MyController_modified.ACD")
+```
+
+The output ACD is byte-for-byte identical to the original for every embedded file that was not
+modified, so Studio 5000 can open it normally.
+
+---
+
 ### Convert ACD to L5X
 
 Export the parsed project as an L5X XML file (importable by Studio 5000):
@@ -80,7 +124,12 @@ The output is pretty-printed by default. Pass `pretty_print=False` for a compact
 ConvertAcdToL5x("MyController.ACD", "MyController.L5X", pretty_print=False).extract()
 ```
 
-> **Note** — The L5X serialisation captures tags, programs, routines, rungs, UDTs, and AOIs.
+> **Note** — The L5X serialisation captures tags, programs, routines (ladder rungs **and** Structured Text
+> source), UDTs, AOIs, and hardware modules.  The ST source export resolves all internal `@hex@`
+> object-ID placeholders to real tag names, including cross-program `\ProgramName.tagName` prefixes and
+> IO-module address references (`ModuleName:slot:type`).  Internal `__SHADOW_*` bookkeeping tags are
+> filtered out so the output matches what the Rockwell Logix SDK `xplode` tool produces.
+>
 > Hardware module metadata (catalog numbers, connection parameters) is not fully round-tripped because
 > Rockwell stores those as opaque CIP identity records in the binary database rather than as strings.
 
