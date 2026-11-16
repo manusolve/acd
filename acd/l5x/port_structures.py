@@ -68,6 +68,15 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
     ],
 
+    # --- Compact GuardLogix 5380 safety CPU PT=14 ---
+    # 5069-L330ERMS3: Root controller.
+    #   Port 1 5069-bus  Upstream=false  Address=0  Bus Size=32 (chassis capacity)
+    #   Port 2 Ethernet  Upstream=false  (no Address)  Bus (no size)
+    (1, 14, 246): [  # 5069-L330ERMS3
+        PortDef(port_id=1, port_type="5069",     upstream_fixed=True,  upstream_port=False, address_mode="zero",  bus_mode="fixed:32"),
+        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=False, address_mode="omit",  bus_mode="always"),
+    ],
+
     # --- Older ControlLogix CPUs (no Ethernet port) PT=14 ---
     # 1756-L72, 1756-L73: only Port 1 ICP.
     # In this dataset, these only appear as remote CPUs (Upstream=true, no Bus).
@@ -126,6 +135,14 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=True,  address_mode="empty", bus_mode="none"),
     ],
 
+    # --- 1734 POINT I/O Ethernet adapters PT=12 ---
+    # Port 1 PointIO downstream (Bus Size from children count).
+    # Port 2 Ethernet upstream. IP stored as ASCII in binary.
+    (1, 12, 196): [  # 1734-AENTR (all revisions share same product code)
+        PortDef(port_id=1, port_type="PointIO",  upstream_fixed=True,  upstream_port=False, address_mode="zero",  bus_mode="children_or_none"),
+        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=True,  address_mode="empty", bus_mode="none"),
+    ],
+
     # --- 5094 Ethernet adapter PT=12 ---
     # Port 1 5094-bus downstream (Bus Size=17 — default 5094 chassis capacity).
     # Port 2 Ethernet upstream. Address slot is stored (observed Address="0" in samples).
@@ -145,6 +162,16 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     (1, 10, 153):[PortDef(port_id=1, port_type="Flex", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1794-IF8IH/A
     (1, 10, 154):[PortDef(port_id=1, port_type="Flex", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1794-OF8IH/A
     (1, 109, 6): [PortDef(port_id=1, port_type="Flex", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1794-IP4/B
+
+    # --- 1734 POINT I/O modules PT=7/10/35/109/155 ---
+    # Single port PointIO, always upstream.
+    (1, 7, 130):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-IB4/C
+    (1, 7, 216):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-IB8/C
+    (1, 7, 232):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-OB8/C
+    (1, 35, 15):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-IB8S/A (safety input)
+    (1, 35, 16):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-OB8S/B (safety output)
+    (1, 109, 16): [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-IK/C
+    (1, 155, 1):  [PortDef(port_id=1, port_type="PointIO", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1734-4IOL/B
 
     # --- 5094 I/O modules PT=7/10/115 ---
     # 5094-IB16/A and 5094-OB16/A: single port 5094, upstream.
@@ -167,7 +194,17 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     (1, 7, 30):  [PortDef(port_id=1, port_type="ICP", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1756-OW16I
     (1, 10, 7):  [PortDef(port_id=1, port_type="ICP", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 1756-IF8/A
 
-    # --- PowerFlex drives PT=123/142/143 ---
+    # --- PowerFlex drives PT=37/45/123/142/143 ---
+    # Port 2 Ethernet upstream. IP stored in binary.
+    (1, 37, 46): [  # 2198-H003-ERS (Kinetix 5500)
+        PortDef(port_id=2, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none"),
+    ],
+    (1, 45, 1): [   # 2198-H003-ERS2 (Kinetix 5700)
+        PortDef(port_id=2, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none"),
+    ],
+    (1, 45, 15): [  # PowerFlex 527-STO CIP Safety
+        PortDef(port_id=2, port_type="Ethernet", upstream_fixed=True, upstream_port=True, address_mode="empty", bus_mode="none"),
+    ],
     # Port 1 RhinoBP downstream, Address=0 (literal zero — root of the RhinoBP bus).
     # Ethernet port upstream (port ID varies by model), IP not stored in binary.
     (1, 123, 1168): [  # PowerFlex 753-NET-E
